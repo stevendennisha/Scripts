@@ -1,0 +1,295 @@
+// N-Way Dimmer v5.2 - Ultimate Production Version
+
+const CONFIG = {
+  dimmerGroup: ["Switch IP", "Switch IP"],
+  wifiIP: "",
+  updateDebounceMs: 25,       // Ultra-fast 25ms debounce
+  networkTimeoutSec: 2,
+  componentId: 0,
+  startupDelayMs: 1000,
+};
+
+const KVS_KEY = "nwayState";
+
+// Global state
+let isUpdatingFromKVS = false;
+let updateTimer = null;
+let flagTimer = null;
+let lastState = { on: false, brightness: 0 };
+let initComplete = false;
+
+// Get WiFi IP with error handling
+function setWifiIP() {
+  try {
+    const wifiStatus = Shelly.getComponentStatus("Wifi");
+    if (wifiStatus && wifiStatus.status === "got ip") {
+      CONFIG.wifiIP = wifiStatus.sta_ip;
+      console.log("WiFi IP:", CONFIG.wifiIP);
+      Timer.set(CONFIG.startupDelayMs, false, initializeSystem);
+    } else {
+      Timer.set(1000, false, setWifiIP);
+    }
+  } catch (e) {
+    console.log("WiFi error:", e);
+    Timer.set(2000, false, setWifiIP);
+  }
+}
+
+// Fast direct control
+function sendToRemote(ip, state) {
+  try {
+    Shelly.call("HTTP.POST", {
+      url: "http://" + ip + "/rpc/Light.Set",
+      body: JSON.stringify({
+        id: CONFIG.componentId,
+        on: state.on,
+        brightness: state.brightness
+      }),
+      timeout: CONFIG.networkTimeoutSec
+    }, function(result, errCode, errMsg) {
+      if (errCode !== 0) {
+        // Fallback to KVS silently
+        sendKVSToRemote(ip, state);
+      }
+    });
+  } catch (e) {
+    console.log("Send error:", e);
+  }
+}
+
+// KVS fallback
+function sendKVSToRemote(ip, state) {
+  try {
+    Shelly.call("HTTP.POST", {
+      url: "http://" + ip + "/rpc/KVS.Set",
+      body: JSON.stringify({
+        key: KVS_KEY,
+        value: { on: state.on, brightness: state.brightness, from: CONFIG.wifiIP }
+      }),
+      timeout: CONFIG.networkTimeoutSec
+    });
+  } catch (e) {
+    // Silent fail for fallback
+  }
+}
+
+// Get dimmer status with error protection
+function getLocalDimmerStatus() {
+  try {
+    const status = Shelly.getComponentStatus("light:" + CONFIG.componentId);
+    if (!status) return lastState || { on: false, brightness: 0 };
+    
+    return {
+      on: status.output === true,
+      brightness: Math.round(status.brightness || 0)
+    };
+  } catch (e) {
+    return lastState || { on: false, brightness: 0 };
+  }
+}
+
+// Set local dimmer with validation
+function setLocalDimmer(state) {
+  try {
+    isUpdatingFromKVS = true;
+    
+    // Safe timer clear
+    if (flagTimer !== null && flagTimer !== undefined) {
+      try { Timer.clear(flagTimer); } catch(e) {}
+      flagTimer = null;
+    }
+    
+    // Clamp brightness for safety
+    let b = state.brightness;
+    if (typeof b !== "number") {
+      b = 0;
+    }
+    b = Math.max(0, Math.min(100, Math.round(b)));
+    
+    Shelly.call("Light.Set", {
+      id: CONFIG.componentId,
+      on: state.on === true,
+      brightness: b
+    });
+    
+    // Reset flag after short delay
+    flagTimer = Timer.set(150, false, function() {
+      isUpdatingFromKVS = false;
+      flagTimer = null;
+    });
+  } catch (e) {
+    console.log("Set error:", e);
+    isUpdatingFromKVS = false;
+  }
+}
+
+// Immediate sync
+function syncToOthers() {
+  try {
+    const state = getLocalDimmerStatus();
+    
+    // Check for actual change
+    if (state.on === lastState.on && state.brightness === lastState.brightness) {
+      return;
+    }
+    
+    lastState = state;
+    console.log("Sync:", state.on, "/", state.brightness);
+    
+    // Direct control to remotes immediately
+    for (let i = 0; i < CONFIG.dimmerGroup.length; i++) {
+      const ip = CONFIG.dimmerGroup[i];
+      if (ip !== CONFIG.wifiIP) {
+        sendToRemote(ip, state);
+      }
+    }
+    
+    // Update KVS in background
+    Shelly.call("KVS.Set", {
+      key: KVS_KEY,
+      value: { on: state.on, brightness: state.brightness, from: CONFIG.wifiIP }
+    });
+  } catch (e) {
+    console.log("Sync error:", e);
+  }
+}
+
+// Handle local changes
+function handleLocalChange() {
+  if (!initComplete || isUpdatingFromKVS) return;
+  
+  // Safe timer clear
+  if (updateTimer !== null && updateTimer !== undefined) {
+    try { Timer.clear(updateTimer); } catch(e) {}
+    updateTimer = null;
+  }
+  
+  // Ultra-fast debounce
+  updateTimer = Timer.set(CONFIG.updateDebounceMs, false, function() {
+    updateTimer = null;
+    syncToOthers();
+  });
+}
+
+// Handle incoming control
+function handleRemoteControl() {
+  isUpdatingFromKVS = true;
+  
+  if (flagTimer !== null && flagTimer !== undefined) {
+    try { Timer.clear(flagTimer); } catch(e) {}
+    flagTimer = null;
+  }
+  
+  flagTimer = Timer.set(150, false, function() {
+    isUpdatingFromKVS = false;
+    flagTimer = null;
+  });
+}
+
+// Handle KVS updates
+function handleKVSUpdate() {
+  if (!initComplete) return;
+  
+  try {
+    Shelly.call("KVS.Get", { key: KVS_KEY }, function(result, errCode, errMsg) {
+      try {
+        if (errCode !== 0 || !result || typeof result.value !== "object") {
+          return;
+        }
+        
+        const kvsState = result.value;
+        
+        // Validate KVS data
+        if (typeof kvsState.on !== "boolean" ||
+            typeof kvsState.brightness !== "number") {
+          return;
+        }
+        
+        // Ignore our own broadcasts
+        if (kvsState.from === CONFIG.wifiIP) return;
+        
+        const currentState = getLocalDimmerStatus();
+        
+        if (currentState.on !== kvsState.on ||
+            currentState.brightness !== kvsState.brightness) {
+          console.log("KVS update from", kvsState.from);
+          setLocalDimmer(kvsState);
+        }
+      } catch (e) {
+        // Silent fail in callback
+      }
+    });
+  } catch (e) {
+    console.log("KVS handler error:", e);
+  }
+}
+
+// Initialize system
+function initializeSystem() {
+  try {
+    console.log("Initializing...");
+    
+    lastState = getLocalDimmerStatus();
+    
+    // Create event handlers with full error protection
+    Shelly.addStatusHandler(function(event) {
+      try {
+        if (!initComplete || !event) return;
+        
+        // Handle light component events
+        if (event.name === "light" &&
+            event.component === "light:" + CONFIG.componentId &&
+            event.delta) {
+          
+          // Check for remote control (http or loopback)
+          if (event.delta.source === "http" || 
+              event.delta.source === "loopback") {
+            handleRemoteControl();
+            return;
+          }
+          
+          // Local change detected
+          if (!isUpdatingFromKVS &&
+              (event.delta.output !== undefined || 
+               event.delta.brightness !== undefined)) {
+            handleLocalChange();
+          }
+        }
+        
+        // KVS fallback handler
+        if (event.component === "sys" &&
+            event.delta &&
+            event.delta.kvs_rev) {
+          handleKVSUpdate();
+        }
+      } catch (e) {
+        console.log("Handler error:", e);
+      }
+    });
+    
+    // Initialize KVS
+    Shelly.call("KVS.Set", {
+      key: KVS_KEY,
+      value: {
+        on: lastState.on,
+        brightness: lastState.brightness,
+        from: CONFIG.wifiIP
+      }
+    });
+    
+    initComplete = true;
+    console.log("Ready");
+  } catch (e) {
+    console.log("Init error:", e);
+  }
+}
+
+// Start with error protection
+try {
+  console.log("N-Way Dimmer v5.2 Ultimate");
+  const info = Shelly.getDeviceInfo();
+  console.log("Device:", info.name);
+  setWifiIP();
+} catch (e) {
+  console.log("Startup error:", e);
+}
